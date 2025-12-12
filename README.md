@@ -17,11 +17,25 @@ Smart Money Concepts (SMC) 기반의 Gate.io 선물 자동매매 봇입니다.
 * 안전 장치: API 오류 처리, 3초 미체결 시 시장가 청산 등 예외 처리 로직 탑재
 
 
-실매매 결과: 익절 1/ 손절 1
+## ☁️ 배포 및 운영 (Deployment)
+
+**Google Cloud Platform (GCP)의 서울 리전(`asia-northeast3`)을 활용하여 지연 시간(Latency)을 최소화하고 안정적인 환경을 구축했습니다.
+
+* Server: GCP Compute Engine
+* Region: Seoul (`asia-northeast3-a`)
+* Spec: `e2-micro` (Free Tier usage for cost efficiency)
+* Instance Info:
+    * Name: `instance-xxxxxxxx-xxxxxx`
+    * IP: `10.xxx.x.x` (Internal) / Protected (External)
+* Environment:
+    * OS: Ubuntu Linux
+    * Tools: `SSH` for access, `tmux` for session persistence
+ 
+##실매매 결과: 익절 1/ 손절 1
 
 손절 주문서 오류-->
 1. OCO 주문 시도: 기본적으로 FuturesPriceTriggeredOrder를 통해 서버 측 손절을 겁니다.
 
 2. 클라이언트 사이드 감시 (Client-side Monitor): 만약 서버 주문이 실패하거나 체결되지 않은 상태에서 가격이 손절가를 뚫고 내려가면, 봇 내부에서 타이머(price_breach_timer)가 작동합니다.
 
-3. 강제 청산: 3초 이상 손절가 아래에 머무는데도 청산이 안 되면, 봇이 즉시 cancel_all을 날리고 시장가(Market)로 강제 청산하는 방어 로직을 추가했습니다."
+3. 강제 청산: 3초 이상 손절가 아래에 머무는데도 청산이 안 되면, 봇이 즉시 cancel_all을 날리고 시장가(Market)로 강제 청산하는 방어 로직을 추가했습니다.
