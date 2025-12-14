@@ -1,3 +1,4 @@
+첫 프로젝트
 Gate.io Futures SMC Trading Bot 
 
 Smart Money Concepts (SMC) 기반의 Gate.io 선물 자동매매 봇입니다.
