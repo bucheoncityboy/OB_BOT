@@ -1,6 +1,4 @@
-# bot.py
-# -*- coding: utf-8 -*-
-
+import asyncio
 import time
 import logging
 import math
@@ -8,8 +6,6 @@ import pandas as pd
 from datetime import datetime
 from gate_api import ApiClient, Configuration, FuturesOrder, FuturesApi, FuturesPriceTriggeredOrder, FuturesPriceTrigger
 from gate_api.exceptions import GateApiException
-
-# 분리한 모듈 import
 from strategy import get_market_structure_trend, find_cisd_setup
 
 class TradingBot:
@@ -30,93 +26,84 @@ class TradingBot:
         self.reinvestment_amount = 0
         self.use_reinvestment_on_next_trade = False
         self.reinvestment_win_streak = 0
-        self.price_breach_timer = None # 손절/익절 미체결 감시 타이머
-        self.pre_flight_checks()
-        self.set_leverage()
+        self.price_breach_timer = None
+
+    async def _run_api(self, func, *args, **kwargs):
+        """Blocking API 호출을 비동기로 래핑"""
+        return await asyncio.to_thread(func, *args, **kwargs)
 
     def handle_api_exception(self, e, context=""):
-        error_context = f"오류 발생 지점: {context}"
         if isinstance(e, GateApiException):
-            logging.error(f"{error_context}\nGate.io 서버 응답: [Label: {e.label}, Message: {e.message}]")
+            logging.error(f"[{context}] Gate API Error: {e.label} - {e.message}")
         else:
-            logging.error(f"{error_context}\n전체 오류 내용: {e}", exc_info=True)
-        return None
+            logging.error(f"[{context}] Error: {e}", exc_info=True)
 
-    def pre_flight_checks(self):
-        logging.info("--- 시작 전 자가진단 시작 ---")
+    async def pre_flight_checks(self):
+        logging.info("Starting pre-flight checks...")
         try:
-            logging.info("1. API 키 유효성 검사 중...")
-            self.futures_api.list_futures_accounts(settle=self.settle)
-            logging.info(" -> API 키가 유효합니다.")
-            
-            logging.info(f"2. {self.contract} 계약 정보 조회 중...")
-            market_info = self.futures_api.get_futures_contract(settle=self.settle, contract=self.contract)
+            await self._run_api(self.futures_api.list_futures_accounts, settle=self.settle)
+            market_info = await self._run_api(self.futures_api.get_futures_contract, settle=self.settle, contract=self.contract)
             self.price_precision = abs(int(math.log10(float(market_info.order_price_round))))
             self.quanto_multiplier = float(market_info.quanto_multiplier)
-            logging.info(f" -> 계약 정보 로드 완료: 가격 정밀도={self.price_precision}, 승수={self.quanto_multiplier}")
-            
-            logging.info("--- 자가진단 통과 ---")
+            logging.info(f"Check Passed. Precision: {self.price_precision}, Multiplier: {self.quanto_multiplier}")
         except Exception as e:
-            self.handle_api_exception(e, "시작 전 자가진단")
+            self.handle_api_exception(e, "Pre-flight")
             raise
 
-    def set_leverage(self):
+    async def set_leverage(self):
         try:
-            logging.info(f"{self.contract}의 레버리지를 {self.params['leverage']}배로 설정합니다...")
-            self.futures_api.update_position_leverage(settle=self.settle, contract=self.contract, leverage=str(self.params['leverage']))
-            logging.info("레버리지 설정 완료.")
+            await self._run_api(
+                self.futures_api.update_position_leverage, 
+                settle=self.settle, contract=self.contract, leverage=str(self.params['leverage'])
+            )
+            logging.info(f"Leverage set to {self.params['leverage']}x")
         except GateApiException as e:
-            if "leverage not changed" in str(e.body):
-                logging.warning("레버리지가 이미 설정되어 있습니다.")
-            else:
-                self.handle_api_exception(e, "레버리지 설정")
-                raise
+            if "leverage not changed" not in str(e.body):
+                self.handle_api_exception(e, "Set Leverage")
 
-    def get_futures_balance(self):
+    async def get_futures_balance(self):
         try:
-            account = self.futures_api.list_futures_accounts(settle=self.settle)
+            account = await self._run_api(self.futures_api.list_futures_accounts, settle=self.settle)
             return float(account.total)
         except GateApiException as e:
-            return self.handle_api_exception(e, "잔고 조회")
+            self.handle_api_exception(e, "Get Balance")
+            return None
 
     def format_price(self, price):
         try:
             return float(f"{price:.{self.price_precision}f}")
-        except (ValueError, TypeError):
-            logging.error(f"가격 포맷팅 실패: {price}")
-            return None
+        except: return None
 
-    def place_order(self, size, price, reduce_only=False):
+    async def place_order(self, size, price, reduce_only=False):
         formatted_price = self.format_price(price)
         if formatted_price is None and price != '0': return None
+        
         client_order_id = f"t-{int(time.time() * 1000)}"
         order = FuturesOrder(
             contract=self.contract, size=size, price=str(formatted_price if price != '0' else '0'),
             tif='gtc', text=client_order_id, reduce_only=reduce_only
         )
         try:
-            created_order = self.futures_api.create_futures_order(settle=self.settle, futures_order=order)
-            side = "매수(롱)" if size > 0 else "매도(숏)"
-            if reduce_only: side = "포지션 종료"
-            logging.info(f"✅ 주문 제출 성공: {side} {abs(size)}계약 @ {formatted_price if price != '0' else 'Market'}")
-            return created_order
+            created = await self._run_api(self.futures_api.create_futures_order, settle=self.settle, futures_order=order)
+            logging.info(f"Order Placed: {size} @ {formatted_price}")
+            return created
         except GateApiException as e:
-            return self.handle_api_exception(e, "주문 제출")
+            self.handle_api_exception(e, "Place Order")
+            return None
 
-    def place_tp_sl_orders(self, size, side, sl_price, tp_price):
+    async def place_tp_sl_orders(self, size, side, sl_price, tp_price):
         try:
             close_size = -size if side == 'long' else size
+            
+            # TP Order
             tp_order = FuturesOrder(
                 contract=self.contract, size=close_size, price=str(self.format_price(tp_price)),
                 tif='gtc', reduce_only=True, text='t-tp'
             )
-            self.futures_api.create_futures_order(settle=self.settle, futures_order=tp_order)
-            logging.info(f"✅ 익절 주문 제출 성공: 포지션 종료 {abs(close_size)}계약 @ {self.format_price(tp_price)}")
+            await self._run_api(self.futures_api.create_futures_order, settle=self.settle, futures_order=tp_order)
 
-            trigger = FuturesPriceTrigger(
-                price=str(self.format_price(sl_price)),
-                rule=1 if side == 'long' else 2
-            )
+            # SL Order (Trigger)
+            trigger = FuturesPriceTrigger(price=str(self.format_price(sl_price)), rule=1 if side == 'long' else 2)
             sl_order = FuturesPriceTriggeredOrder(
                 initial=FuturesOrder(
                     contract=self.contract, size=close_size, price=str(self.format_price(sl_price)),
@@ -124,226 +111,201 @@ class TradingBot:
                 ),
                 trigger=trigger, order_type='limit'
             )
-            self.futures_api.create_price_triggered_order(settle=self.settle, futures_price_triggered_order=sl_order)
-            logging.info(f"✅ 조건부 지정가 손절 주문 제출 성공 (트리거 @ {self.format_price(sl_price)})")
+            await self._run_api(self.futures_api.create_price_triggered_order, settle=self.settle, futures_price_triggered_order=sl_order)
+            logging.info(f"TP/SL Placed. TP: {tp_price}, SL: {sl_price}")
             return True
         except GateApiException as e:
-            self.handle_api_exception(e, "OCO 주문 제출")
-            logging.error("❌ OCO 주문 중 하나가 실패했습니다. 모든 대기 주문을 취소하여 위험을 관리합니다.")
-            self.futures_api.cancel_futures_orders(settle=self.settle, contract=self.contract, side=None)
+            self.handle_api_exception(e, "Place TP/SL")
+            await self._run_api(self.futures_api.cancel_futures_orders, settle=self.settle, contract=self.contract, side=None)
             return False
 
-    def get_current_price(self):
+    async def get_current_price(self):
         try:
-            tickers = self.futures_api.list_futures_tickers(contract=self.contract)
-            if tickers:
-                return float(tickers[0].last)
+            tickers = await self._run_api(self.futures_api.list_futures_tickers, contract=self.contract)
+            if tickers: return float(tickers[0].last)
         except GateApiException as e:
-            self.handle_api_exception(e, "현재가 조회")
+            self.handle_api_exception(e, "Get Price")
         return None
 
-    def force_close_position_market(self, position_size):
-        logging.warning("🚨 지정가 스탑 미체결! 포지션을 시장가로 강제 청산합니다...")
+    async def force_close_position_market(self, position_size):
+        logging.warning("Timeout reached. Force closing position...")
         try:
-            self.futures_api.cancel_futures_orders(settle=self.settle, contract=self.contract)
-            logging.info("강제 청산을 위해 모든 대기 주문을 취소했습니다.")
-            
+            await self._run_api(self.futures_api.cancel_futures_orders, settle=self.settle, contract=self.contract)
             close_size = -position_size
-            self.place_order(size=close_size, price='0', reduce_only=True)
+            await self.place_order(size=close_size, price='0', reduce_only=True)
         except GateApiException as e:
-            self.handle_api_exception(e, "시장가 강제 청산")
+            self.handle_api_exception(e, "Force Close")
 
-    def run(self):
-        logging.info("🚀 선물 트레이딩 봇을 시작합니다...")
-        logging.info(f"전략 파라미터: {self.params}")
+    async def get_historical_data(self, timeframe, limit):
+        try:
+            res = await self._run_api(
+                self.futures_api.list_futures_candlesticks, 
+                settle=self.settle, contract=self.contract, interval=timeframe, limit=limit
+            )
+            data = [[c.t, c.v, c.c, c.h, c.l, c.o] for c in res]
+            df = pd.DataFrame(data, columns=['timestamp', 'volume', 'close', 'high', 'low', 'open'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+            return df.set_index('timestamp').astype(float).sort_index()
+        except GateApiException as e:
+            self.handle_api_exception(e, f"Get Data {timeframe}")
+            return pd.DataFrame()
+
+    async def run_async(self):
+        logging.info("🚀 Async Trading Bot Started")
+        await self.pre_flight_checks()
+        await self.set_leverage()
+        
         while True:
             try:
-                self.check_and_execute_trade()
-                time.sleep(1) # 감시 주기를 1초로 줄여 3초 타임아웃에 더 정확히 반응
+                await self.check_and_execute_trade()
+                await asyncio.sleep(1)
             except Exception as e:
-                logging.error(f"메인 루프에서 예상치 못한 오류 발생: {e}", exc_info=True)
-                time.sleep(60)
+                logging.error(f"Loop Error: {e}", exc_info=True)
+                await asyncio.sleep(60)
 
-    def check_and_execute_trade(self):
+    async def check_and_execute_trade(self):
         try:
-            position = self.futures_api.get_position(settle=self.settle, contract=self.contract)
-            position_size = int(position.size or 0)
+            pos_obj = await self._run_api(self.futures_api.get_position, settle=self.settle, contract=self.contract)
+            position_size = int(pos_obj.size or 0)
         except GateApiException as e:
             if "position not found" in str(e.body):
                 position_size = 0
-                position = None
+                pos_obj = None
             else:
-                self.handle_api_exception(e, "포지션 조회")
+                self.handle_api_exception(e, "Get Position")
                 return
 
         if position_size == 0 and self.last_position_size != 0:
-            self.handle_closed_position(position)
+            await self.handle_closed_position(pos_obj)
         
         self.last_position_size = position_size
         
-        # --- 포지션 보유 시: 3초 미체결 감시 로직 ---
+        # Position Monitoring
         if position_size != 0:
-            current_price = self.get_current_price()
-            if current_price and 'sl' in self.position_details and 'tp' in self.position_details:
-                sl_price = self.position_details['sl']
-                tp_price = self.position_details['tp']
+            curr_price = await self.get_current_price()
+            if curr_price and 'sl' in self.position_details:
+                sl, tp = self.position_details['sl'], self.position_details['tp']
                 side = self.position_details['side']
                 
-                is_sl_breached = (side == 'long' and current_price <= sl_price) or \
-                                 (side == 'short' and current_price >= sl_price)
-                is_tp_breached = (side == 'long' and current_price >= tp_price) or \
-                                 (side == 'short' and current_price <= tp_price)
+                breach = (side == 'long' and (curr_price <= sl or curr_price >= tp)) or \
+                         (side == 'short' and (curr_price >= sl or curr_price <= tp))
 
-                if is_sl_breached or is_tp_breached:
+                if breach:
                     if self.price_breach_timer is None:
                         self.price_breach_timer = time.time()
-                        breached_price_type = "손절가" if is_sl_breached else "익절가"
-                        logging.warning(f"{breached_price_type} 도달! 3초 미체결 감시를 시작합니다...")
+                        logging.warning("Price breached TP/SL. Monitoring execution...")
                 else:
                     self.price_breach_timer = None
 
                 if self.price_breach_timer and (time.time() - self.price_breach_timer > 3):
-                    self.force_close_position_market(position_size)
+                    await self.force_close_position_market(position_size)
             return
 
-        # --- 포지션 없을 시: 새로운 거래 탐색 로직 ---
-        logging.info("새로운 거래 기회를 탐색합니다...")
-        df = self.get_historical_data(self.contract, self.params['timeframe'], self.params['swing_lookback'] + 50)
-        trend_df = self.get_historical_data(self.contract, self.params['trend_timeframe'], self.params['htf_swing_lookback'] + 50)
-        if df.empty or trend_df.empty:
-            return
+        # New Trade Logic
+        # Asyncio Gather for Parallel Fetching
+        df_task = self.get_historical_data(self.params['timeframe'], self.params['swing_lookback'] + 50)
+        trend_task = self.get_historical_data(self.params['trend_timeframe'], self.params['htf_swing_lookback'] + 50)
+        df, trend_df = await asyncio.gather(df_task, trend_task)
 
-        # 외부 strategy 모듈 함수 사용
-        htf_trend = get_market_structure_trend(df_slice=trend_df)
+        if df.empty or trend_df.empty: return
+
+        htf_trend = get_market_structure_trend(trend_df)
         new_setup = find_cisd_setup(df, self.params)
 
         if self.active_order:
             if new_setup:
-                logging.info("🔄 새로운 셋업 발견. 기존 주문을 교체합니다.")
-                if self.cancel_active_order():
-                    self.evaluate_and_place_order(new_setup, htf_trend)
+                logging.info("New setup found. Replacing order.")
+                if await self.cancel_active_order():
+                    await self.evaluate_and_place_order(new_setup, htf_trend)
             else:
-                self.check_active_order_status()
+                await self.check_active_order_status()
         elif new_setup:
-            self.evaluate_and_place_order(new_setup, htf_trend)
-        else:
-            logging.info(f"현재 추세: {htf_trend}. 유효한 셋업을 찾지 못했습니다.")
+            await self.evaluate_and_place_order(new_setup, htf_trend)
 
-    def evaluate_and_place_order(self, setup, htf_trend):
-        entry_price = setup['entry_price']
-        sl_price = setup['sl_price']
-        risk_dist = abs(entry_price - sl_price)
+    async def evaluate_and_place_order(self, setup, htf_trend):
+        entry, sl = setup['entry_price'], setup['sl_price']
+        risk_dist = abs(entry - sl)
         if risk_dist <= 0: return
 
-        risk_amount = self.reinvestment_amount if self.use_reinvestment_on_next_trade else self.params['risk_per_trade_usd']
-        risk_amount = max(0, risk_amount)
-        if risk_amount <= 0: return
+        risk_amt = self.reinvestment_amount if self.use_reinvestment_on_next_trade else self.params['risk_per_trade_usd']
+        if risk_amt <= 0: return
 
-        size_in_usd = (risk_amount * float(self.params['leverage']))
-        size = int((size_in_usd / entry_price) / self.quanto_multiplier)
+        size_usd = risk_amt * float(self.params['leverage'])
+        size = int((size_usd / entry) / self.quanto_multiplier)
         if size == 0: return
         
-        if setup['type'] == 'bullish' and htf_trend == 'UPTREND':
-            logging.info(f"📈 [롱 셋업 발견] 진입가: {entry_price}, 손절가: {sl_price}")
-            order = self.place_order(size, entry_price)
+        if (setup['type'] == 'bullish' and htf_trend == 'UPTREND') or \
+           (setup['type'] == 'bearish' and htf_trend == 'DOWNTREND'):
+            
+            actual_size = size if setup['type'] == 'bullish' else -size
+            side_str = 'long' if setup['type'] == 'bullish' else 'short'
+            
+            logging.info(f"Setup found ({side_str}). Entry: {entry}, SL: {sl}")
+            order = await self.place_order(actual_size, entry)
+            
             if order:
                 self.active_order = order
-                self.position_details = {'sl': sl_price, 'tp': entry_price + risk_dist * self.params['rr_ratio'], 'side': 'long', 'size': size}
+                tp = entry + (risk_dist * self.params['rr_ratio']) if side_str == 'long' else entry - (risk_dist * self.params['rr_ratio'])
+                self.position_details = {'sl': sl, 'tp': tp, 'side': side_str, 'size': actual_size}
 
-        elif setup['type'] == 'bearish' and htf_trend == 'DOWNTREND':
-            logging.info(f"📉 [숏 셋업 발견] 진입가: {entry_price}, 손절가: {sl_price}")
-            order = self.place_order(-size, entry_price)
-            if order:
-                self.active_order = order
-                self.position_details = {'sl': sl_price, 'tp': entry_price - risk_dist * self.params['rr_ratio'], 'side': 'short', 'size': size}
-
-    def check_active_order_status(self):
+    async def check_active_order_status(self):
         if not self.active_order: return
         try:
-            order_status = self.futures_api.get_futures_order(settle=self.settle, order_id=self.active_order.id)
-            if order_status.status == 'finished':
-                if order_status.finish_as == 'filled':
-                    logging.info(f"🎉 주문 체결! {self.position_details['side'].upper()} 포지션에 진입합니다.")
-                    self.position_details['entry_price'] = float(order_status.fill_price)
-                    if self.place_tp_sl_orders(
-                        size=self.position_details['size'], side=self.position_details['side'],
-                        sl_price=self.position_details['sl'], tp_price=self.position_details['tp']
-                    ):
-                        logging.info("✅ OCO 주문(TP/SL) 제출 완료. 봇은 이제 미체결을 감시합니다.")
-                    else:
-                        logging.error("❌ OCO 주문 제출 실패. 포지션을 수동으로 관리해야 합니다.")
-                    self.active_order = None
+            status = await self._run_api(self.futures_api.get_futures_order, settle=self.settle, order_id=self.active_order.id)
+            if status.status == 'finished':
+                if status.finish_as == 'filled':
+                    logging.info("Order Filled. Placing OCO...")
+                    self.position_details['entry_price'] = float(status.fill_price)
+                    res = await self.place_tp_sl_orders(
+                        self.position_details['size'], self.position_details['side'],
+                        self.position_details['sl'], self.position_details['tp']
+                    )
+                    if not res: logging.error("OCO Failed.")
                 else:
-                    logging.info(f"주문이 체결되지 않고 종료되었습니다: {order_status.finish_as}")
-                    self.active_order = None; self.position_details = {}
-        except GateApiException as ex:
-            if "order not found" in str(ex.body):
-                 logging.warning("미체결 주문을 찾을 수 없습니다. (사용자가 취소한 것으로 간주)")
-            else:
-                self.handle_api_exception(ex, "미체결 주문 확인")
-            self.active_order = None; self.position_details = {}
-            
-    def cancel_active_order(self):
+                    logging.info(f"Order finished as {status.finish_as}")
+                self.active_order = None
+        except GateApiException as e:
+            if "order not found" not in str(e.body):
+                self.handle_api_exception(e, "Check Order")
+            self.active_order = None
+
+    async def cancel_active_order(self):
         if not self.active_order: return False
         try:
-            logging.info(f"기존 주문(ID: {self.active_order.id})을 취소합니다...")
-            self.futures_api.cancel_futures_order(settle=self.settle, order_id=self.active_order.id)
-            logging.info("✅ 주문 취소 성공.")
-            self.active_order = None; self.position_details = {}
+            await self._run_api(self.futures_api.cancel_futures_order, settle=self.settle, order_id=self.active_order.id)
+            self.active_order = None
             return True
         except GateApiException as e:
             if "order not found" in str(e.body):
-                logging.warning("취소하려는 주문을 찾을 수 없습니다.")
-                self.active_order = None; self.position_details = {}
+                self.active_order = None
                 return True
-            self.handle_api_exception(e, "주문 취소")
+            self.handle_api_exception(e, "Cancel Order")
             return False
 
-    def handle_closed_position(self, position_obj):
-        self.price_breach_timer = None # 타이머 초기화
-        logging.info("포지션이 종료되었습니다. 거래 기록 및 복리 로직을 처리합니다.")
-        
-        realised_pnl = float(position_obj.realised_pnl) if position_obj and position_obj.realised_pnl else self.position_details.get('realised_pnl', 0)
-        trade_log = {
-            'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'side': self.position_details.get('side', 'N/A').upper(),
-            'size': abs(self.last_position_size),
-            'entry': self.position_details.get('entry_price', 0.0),
-            'pnl': realised_pnl,
-        }
-        logging.info(f"거래 기록: {trade_log}")
+    async def handle_closed_position(self, pos_obj):
+        self.price_breach_timer = None
+        pnl = float(pos_obj.realised_pnl) if pos_obj and pos_obj.realised_pnl else 0
+        logging.info(f"Position Closed. PnL: {pnl}")
         
         if self.params['use_reinvestment']:
-            current_balance = self.get_futures_balance()
-            if current_balance is not None:
-                if not self.reinvestment_mode_activated and current_balance >= self.initial_capital * 2:
+            bal = await self.get_futures_balance()
+            if bal:
+                if not self.reinvestment_mode_activated and bal >= self.initial_capital * 2:
                     self.reinvestment_mode_activated = True
-                    logging.info(f"--- 💰 자본 2배 달성! ({datetime.now().strftime('%Y-%m-%d')}) 복리 모드를 활성화합니다. ---")
+                    logging.info("Compounding Mode Activated.")
                 
                 if self.reinvestment_mode_activated:
-                    is_win = realised_pnl > 0
-                    if current_balance < self.initial_capital * 2:
-                        self.reinvestment_mode_activated = False; self.reinvestment_amount = 0; self.use_reinvestment_on_next_trade = False; self.reinvestment_win_streak = 0
-                    elif is_win:
+                    if bal < self.initial_capital * 2:
+                        self.reinvestment_mode_activated = False
+                        self.reinvestment_amount = 0
+                    elif pnl > 0:
                         self.reinvestment_win_streak += 1
-                        if self.reinvestment_win_streak >= 2:
-                            self.reinvestment_mode_activated = False; self.reinvestment_amount = 0; self.use_reinvestment_on_next_trade = False; self.reinvestment_win_streak = 0
-                        else:
-                            self.reinvestment_amount = realised_pnl * self.params['reinvestment_percent']
+                        if self.reinvestment_win_streak < 2:
+                            self.reinvestment_amount = pnl * self.params['reinvestment_percent']
                             self.use_reinvestment_on_next_trade = True
-                    else:
-                        self.reinvestment_mode_activated = False; self.reinvestment_amount = 0; self.use_reinvestment_on_next_trade = False; self.reinvestment_win_streak = 0
+                            return
+                    
+                    self.reinvestment_amount = 0
+                    self.use_reinvestment_on_next_trade = False
+                    self.reinvestment_win_streak = 0
         self.position_details = {}
-
-    def get_historical_data(self, contract, timeframe, limit):
-        try:
-            api_response = self.futures_api.list_futures_candlesticks(settle=self.settle, contract=contract, interval=timeframe, limit=limit)
-            data = [[candle.t, candle.v, candle.c, candle.h, candle.l, candle.o] for candle in api_response]
-            df = pd.DataFrame(data, columns=['t', 'v', 'c', 'h', 'l', 'o'])
-            df = df.rename(columns={'t': 'timestamp', 'o': 'open', 'h': 'high', 'l': 'low', 'c': 'close', 'v': 'volume'})
-            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-            df = df.set_index('timestamp')
-            return df.astype(float).sort_index()
-        except GateApiException as ex:
-            self.handle_api_exception(ex, f"{timeframe} 데이터 다운로드")
-            return pd.DataFrame()
